@@ -1251,7 +1251,7 @@ class Hyperparameters:
     train_batch_size: int = 2048 * 16 * 8
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
-    val_temperature: float = 1.0  # eval-only softmax temperature
+    val_temperature: float = 1.1  # eval-only softmax temperature
     # optimization
     num_scheduled_iterations: int = 2205  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
@@ -1489,24 +1489,12 @@ for step in range(train_steps + 1):
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-        # build an uncompiled eval model so we can access logits for temperature scaling
-        eval_model = GPT(
-            vocab_size=model.embed.num_embeddings,
-            num_layers=len(model.blocks),
-            num_heads=model.blocks[1].attn.num_heads,
-            head_dim=model.blocks[1].attn.head_dim,
-            model_dim=model.blocks[1].attn.dim,
-            max_seq_len=model.yarn.max_seq_len,
-        ).cuda()
-        for m in eval_model.modules():
-            if isinstance(m, (nn.Embedding, nn.Linear)):
-                m.bfloat16()
-        eval_model.load_state_dict(get_model_state_dict(model))
-        copy_yarn_state(model, eval_model)
+        # use the original (uncompiled) module to access logits without doubling weights
+        eval_model = model._orig_mod if hasattr(model, "_orig_mod") else model
         eval_model.eval()
 
         val_nll, val_tokens = evaluate_with_temperature(eval_model, val_loader, val_steps, ws_short, ws_long, args.val_temperature)
-        del val_loader, eval_model
+        del val_loader
         dist.all_reduce(val_nll, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_tokens, op=dist.ReduceOp.SUM)
         val_loss = (val_nll / val_tokens).item()
