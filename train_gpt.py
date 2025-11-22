@@ -972,7 +972,7 @@ class GPT(nn.Module):
         self.lm_head.weight.lr_mul = 1.0
         self.scalars.lr_mul = 5.0
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int):
+    def _forward_logits(self, input_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int):
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
@@ -1032,6 +1032,14 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / 7.5)
+        return logits
+
+    def forward_logits(self, input_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int):
+        # Expose float32 logits for eval-time tricks without touching the compiled training model.
+        return self._forward_logits(input_seq, seqlens, ws_short, ws_long).float()
+
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int):
+        logits = self._forward_logits(input_seq, seqlens, ws_short, ws_long)
         logits_for_loss = logits.float() if not self.training else logits
         loss = F.cross_entropy(
             logits_for_loss.view(-1, logits_for_loss.size(-1)),
@@ -1039,6 +1047,13 @@ class GPT(nn.Module):
             reduction="sum" if self.training else "mean",
         )
         return loss
+
+# copy non-persistent Yarn buffers so eval model matches training-time rope state
+def copy_yarn_state(src_model: GPT, dst_model: GPT):
+    dst_model.yarn.angular_freq = src_model.yarn.angular_freq.clone()
+    dst_model.yarn.cos.copy_(src_model.yarn.cos)
+    dst_model.yarn.sin.copy_(src_model.yarn.sin)
+    dst_model.yarn.attn_scale = src_model.yarn.attn_scale
 
 # -----------------------------------------------------------------------------
 # Distributed data loader
@@ -1228,6 +1243,7 @@ class Hyperparameters:
     train_batch_size: int = 2048 * 16 * 8
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
+    val_temperature: float = 1.0  # eval-only softmax temperature
     # optimization
     num_scheduled_iterations: int = 2205  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
@@ -1288,6 +1304,23 @@ def nvidia_smi():
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
 print0("="*100)
+
+@torch.no_grad()
+def evaluate_with_temperature(eval_model: GPT, val_loader, val_steps: int, ws_short: int, ws_long: int, temperature: float):
+    assert temperature > 0, "val_temperature must be positive"
+    total_nll = torch.zeros(1, device=device, dtype=torch.float64)
+    total_tokens = torch.zeros(1, device=device, dtype=torch.float64)
+    for _ in range(val_steps):
+        inputs, targets, cum_seqlens = next(val_loader)
+        logits = eval_model.forward_logits(inputs, cum_seqlens, ws_short, ws_long)
+        loss_sum = F.cross_entropy(
+            (logits / temperature).float().view(-1, logits.size(-1)),
+            targets,
+            reduction="sum",
+        )
+        total_nll += loss_sum.double()
+        total_tokens += targets.numel()
+    return total_nll, total_tokens
 
 model: nn.Module = GPT(
     vocab_size=50257,
@@ -1448,15 +1481,28 @@ for step in range(train_steps + 1):
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-        val_loss = 0
-        with torch.no_grad():
-            for _ in range(val_steps):
-                inputs, targets, cum_seqlens = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, ws_short, ws_long)
-        val_loss /= val_steps
-        del val_loader
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        # build an uncompiled eval model so we can access logits for temperature scaling
+        eval_model = GPT(
+            vocab_size=model.embed.num_embeddings,
+            num_layers=len(model.blocks),
+            num_heads=model.blocks[1].attn.num_heads,
+            head_dim=model.blocks[1].attn.head_dim,
+            model_dim=model.blocks[1].attn.dim,
+            max_seq_len=model.yarn.max_seq_len,
+        ).cuda()
+        for m in eval_model.modules():
+            if isinstance(m, (nn.Embedding, nn.Linear)):
+                m.bfloat16()
+        eval_model.load_state_dict(model.state_dict())
+        copy_yarn_state(model, eval_model)
+        eval_model.eval()
+
+        val_nll, val_tokens = evaluate_with_temperature(eval_model, val_loader, val_steps, ws_short, ws_long, args.val_temperature)
+        del val_loader, eval_model
+        dist.all_reduce(val_nll, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_tokens, op=dist.ReduceOp.SUM)
+        val_loss = (val_nll / val_tokens).item()
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} (T={args.val_temperature:.2f}) train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
