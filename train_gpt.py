@@ -1050,10 +1050,18 @@ class GPT(nn.Module):
 
 # copy non-persistent Yarn buffers so eval model matches training-time rope state
 def copy_yarn_state(src_model: GPT, dst_model: GPT):
-    dst_model.yarn.angular_freq = src_model.yarn.angular_freq.clone()
-    dst_model.yarn.cos.copy_(src_model.yarn.cos)
-    dst_model.yarn.sin.copy_(src_model.yarn.sin)
-    dst_model.yarn.attn_scale = src_model.yarn.attn_scale
+    src = src_model._orig_mod if hasattr(src_model, "_orig_mod") else src_model
+    dst_model.yarn.angular_freq = src.yarn.angular_freq.clone()
+    dst_model.yarn.cos.copy_(src.yarn.cos)
+    dst_model.yarn.sin.copy_(src.yarn.sin)
+    dst_model.yarn.attn_scale = src.yarn.attn_scale
+
+def get_model_state_dict(mod: nn.Module):
+    sd = mod.state_dict()
+    if any(k.startswith("_orig_mod.") for k in sd):
+        prefix = "_orig_mod."
+        sd = {k[len(prefix):]: v for k, v in sd.items()}
+    return sd
 
 # -----------------------------------------------------------------------------
 # Distributed data loader
@@ -1493,7 +1501,7 @@ for step in range(train_steps + 1):
         for m in eval_model.modules():
             if isinstance(m, (nn.Embedding, nn.Linear)):
                 m.bfloat16()
-        eval_model.load_state_dict(model.state_dict())
+        eval_model.load_state_dict(get_model_state_dict(model))
         copy_yarn_state(model, eval_model)
         eval_model.eval()
 
