@@ -1851,6 +1851,9 @@ if master_process:
     print(logfile)
 def print0(s, console=False):
     if master_process:
+        s_str = str(s)
+        if s_str.startswith("step:") and "val_loss:" not in s_str:
+            return
         with open(logfile, "a") as f:
             if console:
                 print(s)
