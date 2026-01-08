@@ -1844,17 +1844,18 @@ master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 # begin logging
 logfile = None
+logfile_handle = None
 if master_process:
     run_id = args.run_id
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
+    logfile_handle = open(logfile, "a", buffering=1)
 def print0(s, console=False):
     if master_process:
-        with open(logfile, "a") as f:
-            if console:
-                print(s)
-            print(s, file=f)
+        if console:
+            print(s)
+        print(s, file=logfile_handle)
 
 # begin by printing this file (the Python code)
 print0(code)
