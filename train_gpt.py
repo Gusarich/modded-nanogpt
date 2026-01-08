@@ -1844,17 +1844,18 @@ master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 # begin logging
 logfile = None
+logfile_handle = None
 if master_process:
     run_id = args.run_id
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
+    logfile_handle = open(logfile, "a", buffering=1024 * 1024)
 def print0(s, console=False):
     if master_process:
-        with open(logfile, "a") as f:
-            if console:
-                print(s)
-            print(s, file=f)
+        if console and not str(s).startswith("step:"):
+            print(s)
+        logfile_handle.write(str(s) + "\n")
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -1990,4 +1991,6 @@ for step in range(train_steps + 1):
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+if master_process:
+    logfile_handle.flush()
 dist.destroy_process_group()
