@@ -1,0 +1,1037 @@
+name: runpod nanogpt (8x H100 SXM)
+
+on:
+    push:
+        branches:
+            - "**"
+    workflow_dispatch:
+        inputs:
+            action:
+                description: "run (default) or cleanup (delete RunPod pods created by this workflow)"
+                required: false
+                default: "run"
+            cloud_mode:
+                description: "default (SECURE then fallback) or secure_only (no COMMUNITY fallback; may wait for capacity)"
+                required: false
+                default: "default"
+
+concurrency:
+    group: runpod-nanogpt
+    cancel-in-progress: false
+
+jobs:
+    cleanup:
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'cleanup' }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 60
+        env:
+            RUNPOD_API_BASE: https://rest.runpod.io/v1
+            RUNPOD_POD_NAME: gh-modded-nanogpt-ci
+        steps:
+            - name: Install local deps
+              run: |
+                  set -euo pipefail
+                  sudo apt-get update
+                  sudo apt-get install -y jq
+
+            - name: Delete RunPod pods by prefix
+              env:
+                  RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+              run: |
+                  set -euo pipefail
+                  : "${RUNPOD_API_KEY:?missing RUNPOD_API_KEY}"
+
+                  prefix="${RUNPOD_POD_NAME:?missing RUNPOD_POD_NAME}"
+                  pods="$(curl -sS -H "Authorization: Bearer $RUNPOD_API_KEY" "$RUNPOD_API_BASE/pods")"
+                  ids="$(jq -r --arg p "$prefix" '.[] | select(.name? and (.name | startswith($p))) | .id' <<<"$pods")"
+
+                  if [[ -z "${ids:-}" ]]; then
+                    echo "No pods found with prefix: $prefix"
+                    exit 0
+                  fi
+
+                  echo "Deleting pods with prefix: $prefix"
+                  echo "$ids"
+
+                  for id in $ids; do
+                    echo "Deleting pod: $id"
+                    set +e
+                    http_status="$(curl -sS -X DELETE "$RUNPOD_API_BASE/pods/$id" \
+                      -H "Authorization: Bearer $RUNPOD_API_KEY" \
+                      -w '%{http_code}' -o /dev/null)"
+                    set -e
+                    if [[ "$http_status" -ge 200 && "$http_status" -lt 300 ]]; then
+                      continue
+                    fi
+
+                    set +e
+                    http_status2="$(curl -sS -X POST "$RUNPOD_API_BASE/pods/$id/terminate" \
+                      -H "Authorization: Bearer $RUNPOD_API_KEY" \
+                      -w '%{http_code}' -o /dev/null)"
+                    set -e
+                    if [[ "$http_status2" -ge 200 && "$http_status2" -lt 300 ]]; then
+                      continue
+                    fi
+
+                    echo "Failed to delete/terminate pod $id (DELETE=$http_status POST/terminate=$http_status2); continuing." >&2
+                  done
+
+    run:
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.action == '' || github.event.inputs.action == 'run' }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 360
+
+        env:
+            RUNPOD_API_BASE: https://rest.runpod.io/v1
+            # Keep a single long-lived pod (stopped between runs) so `/workspace` persists across pushes.
+            # This enables caching of pip wheels + venv, HF downloads, and TorchInductor/Triton compilation artifacts.
+            RUNPOD_POD_NAME: gh-modded-nanogpt-ci
+            RUNPOD_MAX_PODS: 5
+
+            # Secure Cloud, 8x H100 SXM (RunPod GPU ID for H100 SXM is "NVIDIA H100 80GB HBM3")
+            RUNPOD_CLOUD_TYPE: SECURE
+            # Fallback cloud types to try when capacity is unavailable (space-separated).
+            RUNPOD_CLOUD_TYPE_FALLBACKS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.cloud_mode == 'secure_only' && '' || 'COMMUNITY' }}
+            RUNPOD_GPU_TYPE_ID: "NVIDIA H100 80GB HBM3"
+            RUNPOD_GPU_COUNT: 8
+
+            # Pick a RunPod PyTorch image that already works well on RunPod
+            RUNPOD_IMAGE: "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
+
+            # Storage (adjust as needed)
+            RUNPOD_CONTAINER_DISK_GB: 200
+            RUNPOD_VOLUME_GB: 500
+            RUNPOD_VOLUME_MOUNT_PATH: /workspace
+
+        steps:
+            - name: Install local deps
+              run: |
+                  set -euo pipefail
+                  sudo apt-get update
+                  sudo apt-get install -y jq openssh-client
+
+            - name: Prepare SSH key (private -> file, derive public key)
+              run: |
+                  set -euo pipefail
+                  mkdir -p ~/.ssh
+                  # Write private key exactly, fix CRLF just in case
+                  printf '%s' "${{ secrets.RUNPOD_SSH_KEY }}" | tr -d '\r' > ~/.ssh/runpod_key
+                  chmod 600 ~/.ssh/runpod_key
+
+                  ssh-keygen -y -f ~/.ssh/runpod_key > ~/.ssh/runpod_key.pub
+                  chmod 644 ~/.ssh/runpod_key.pub
+
+            - name: Acquire RunPod pod (pool, Secure, 8x H100 SXM)
+              id: acquire_pod
+              env:
+                  RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+              run: |
+                  set -euo pipefail
+
+                  POD_NAME_PREFIX="${RUNPOD_POD_NAME:?missing RUNPOD_POD_NAME}"
+                  MAX_PODS="${RUNPOD_MAX_PODS:-5}"
+                  PUBKEY="$(cat ~/.ssh/runpod_key.pub)"
+
+                  list_pods() {
+                    curl -sS -H "Authorization: Bearer $RUNPOD_API_KEY" "$RUNPOD_API_BASE/pods"
+                  }
+
+                  pods_sorted() {
+                    jq -c --arg p "$POD_NAME_PREFIX" '
+                      [ .[]
+                        | select(.name? and (.name | startswith($p)))
+                        | {
+                            id: .id,
+                            name: .name,
+                            createdAt: (.createdAt // .created_at // .created // "")
+                          }
+                      ]
+                      | sort_by(.createdAt)
+                    '
+                  }
+
+                  create_pod() {
+                    name="$1"
+                    cloud_type="${2:-${RUNPOD_CLOUD_TYPE:-SECURE}}"
+                    gpu_type_id="${3:-${RUNPOD_GPU_TYPE_ID:?missing RUNPOD_GPU_TYPE_ID}}"
+                    payload="$(jq -n \
+                      --arg name "$name" \
+                      --arg image "$RUNPOD_IMAGE" \
+                      --arg gpuType "$gpu_type_id" \
+                      --arg mountPath "$RUNPOD_VOLUME_MOUNT_PATH" \
+                      --arg pubkey "$PUBKEY" \
+                      --arg cloudType "$cloud_type" \
+                      --argjson gpuCount $RUNPOD_GPU_COUNT \
+                      --argjson containerDisk $RUNPOD_CONTAINER_DISK_GB \
+                      --argjson volumeGb $RUNPOD_VOLUME_GB \
+                      '{
+                        cloudType: $cloudType,
+                        computeType: "GPU",
+                        gpuCount: $gpuCount,
+                        gpuTypeIds: [$gpuType],
+                        imageName: $image,
+                        name: $name,
+                        interruptible: false,
+                        supportPublicIp: true,
+                        ports: ["22/tcp"],
+                        containerDiskInGb: $containerDisk,
+                        volumeInGb: $volumeGb,
+                        volumeMountPath: $mountPath,
+                        env: { SSH_PUBLIC_KEY: $pubkey }
+                      }')"
+
+                    resp=""
+                    http_status=""
+                    for attempt in $(seq 1 5); do
+                      set +e
+                      resp_and_status="$(
+                        curl -sS -X POST "$RUNPOD_API_BASE/pods" \
+                          -H "Authorization: Bearer $RUNPOD_API_KEY" \
+                          -H "Content-Type: application/json" \
+                          -d "$payload" \
+                          -w $'\\n__HTTP_STATUS__:%{http_code}\\n'
+                      )"
+                      curl_rc=$?
+                      set -e
+
+                      http_status="$(awk -F: '/^__HTTP_STATUS__:/ {print $2}' <<<"$resp_and_status" | tail -n 1)"
+                      resp="$(sed '/^__HTTP_STATUS__:/d' <<<"$resp_and_status")"
+
+                      if [[ $curl_rc -eq 0 && -n "$http_status" && "$http_status" -ge 200 && "$http_status" -lt 300 ]]; then
+                        break
+                      fi
+
+                      err="$(jq -r '.error // .message // empty' <<<"$resp" 2>/dev/null || true)"
+                      echo "Create pod attempt $attempt failed (cloudType=$cloud_type gpuTypeId=$gpu_type_id curl_rc=$curl_rc http_status=$http_status). Response:" >&2
+                      echo "$resp" >&2
+
+                      if [[ "${err,,}" == *"no instances currently available"* || "${resp,,}" == *"no instances currently available"* ]]; then
+                        # Capacity outage for this instance type; let the outer loop back off and retry.
+                        return 10
+                      fi
+
+                      if [[ "$http_status" == "500" || "$http_status" == "502" || "$http_status" == "503" || "$http_status" == "504" ]]; then
+                        sleep $((attempt * 5))
+                        continue
+                      fi
+
+                      return 1
+                    done
+
+                    if [[ -z "$http_status" || "$http_status" -lt 200 || "$http_status" -ge 300 ]]; then
+                      echo "Create pod request failed after retries (http_status=$http_status)." >&2
+                      return 1
+                    fi
+
+                    pod_id="$(jq -r '.id' <<<"$resp")"
+                    if [[ -z "$pod_id" || "$pod_id" == "null" ]]; then
+                      echo "Create pod failed, response:" >&2
+                      echo "$resp" >&2
+                      return 1
+                    fi
+
+                    echo "$pod_id"
+                  }
+
+                  delete_pod() {
+                    pod_id="$1"
+                    echo "Deleting pod: $pod_id"
+
+                    set +e
+                    http_status="$(curl -sS -X DELETE "$RUNPOD_API_BASE/pods/$pod_id" \
+                      -H "Authorization: Bearer $RUNPOD_API_KEY" \
+                      -w '%{http_code}' -o /dev/null)"
+                    set -e
+                    if [[ "$http_status" -ge 200 && "$http_status" -lt 300 ]]; then
+                      return 0
+                    fi
+
+                    # Fallback if the API uses a terminate endpoint.
+                    set +e
+                    http_status2="$(curl -sS -X POST "$RUNPOD_API_BASE/pods/$pod_id/terminate" \
+                      -H "Authorization: Bearer $RUNPOD_API_KEY" \
+                      -w '%{http_code}' -o /dev/null)"
+                    set -e
+                    if [[ "$http_status2" -ge 200 && "$http_status2" -lt 300 ]]; then
+                      return 0
+                    fi
+
+                    echo "Failed to delete/terminate pod $pod_id (DELETE=$http_status POST/terminate=$http_status2); continuing." >&2
+                    return 1
+                  }
+
+                  try_start_pod() {
+                    pod_id="$1"
+                    set +e
+                    resp_and_status="$(
+                      curl -sS -X POST "$RUNPOD_API_BASE/pods/$pod_id/start" \
+                        -H "Authorization: Bearer $RUNPOD_API_KEY" \
+                        -w $'\\n__HTTP_STATUS__:%{http_code}\\n'
+                    )"
+                    curl_rc=$?
+                    set -e
+
+                    http_status="$(awk -F: '/^__HTTP_STATUS__:/ {print $2}' <<<"$resp_and_status" | tail -n 1)"
+                    resp="$(sed '/^__HTTP_STATUS__:/d' <<<"$resp_and_status")"
+                    err="$(jq -r '.error // .message // empty' <<<"$resp" 2>/dev/null || true)"
+
+                    echo "start http_status=$http_status curl_rc=$curl_rc ${err:+error=$err}"
+                    if [[ -n "${resp:-}" && "${resp:-}" != "null" ]]; then
+                      echo "start response: $resp"
+                    fi
+
+                    # Return code 10 == capacity error.
+                    if [[ "$http_status" == "500" || "$http_status" == "502" || "$http_status" == "503" || "$http_status" == "504" ]]; then
+                      if [[ "${err,,}" == *"not enough free gpus"* || "${resp,,}" == *"not enough free gpus"* ]]; then
+                        return 10
+                      fi
+                    fi
+
+                    if [[ $curl_rc -eq 0 && -n "$http_status" && "$http_status" -ge 200 && "$http_status" -lt 300 ]]; then
+                      return 0
+                    fi
+
+                    return 1
+                  }
+
+                  wait_for_endpoint() {
+                    pod_id="$1"
+                    timeout_secs="${2:-180}"
+
+                    started="$(date +%s)"
+                    last_start_epoch=0
+                    while true; do
+                      now="$(date +%s)"
+                      if (( now - started > timeout_secs )); then
+                        echo "Timed out waiting for pod endpoint (pod_id=$pod_id)." >&2
+                        return 1
+                      fi
+
+                      pod="$(curl -sSf -H "Authorization: Bearer $RUNPOD_API_KEY" "$RUNPOD_API_BASE/pods/$pod_id")"
+                      status="$(jq -r '.desiredStatus // empty' <<<"$pod")"
+                      ip="$(jq -r '.publicIp // empty' <<<"$pod")"
+                      port="$(jq -r '.portMappings["22"] // empty' <<<"$pod")"
+
+                      if [[ "$status" == "RUNNING" && -n "$ip" && -n "$port" ]]; then
+                        echo "POD_ID=$pod_id" >> "$GITHUB_ENV"
+                        echo "POD_IP=$ip" >> "$GITHUB_ENV"
+                        echo "POD_SSH_PORT=$port" >> "$GITHUB_ENV"
+                        return 0
+                      fi
+
+                      if [[ "$status" == "EXITED" || "$status" == "STOPPED" ]]; then
+                        now_epoch="$(date +%s)"
+                        if (( now_epoch - last_start_epoch >= 60 )); then
+                          last_start_epoch="$now_epoch"
+                          echo "pod is $status; attempting start..."
+                          try_start_pod "$pod_id"
+                          start_rc=$?
+                          if [[ $start_rc -eq 10 ]]; then
+                            return 10
+                          fi
+                        fi
+                      fi
+
+                      echo "waiting: status=$status ip=$ip port=$port"
+                      sleep 10
+                    done
+                  }
+
+                  acquire_one_pod() {
+                    pod_id="$1"
+                    echo "Trying pod: $pod_id"
+
+                    pod="$(curl -sSf -H "Authorization: Bearer $RUNPOD_API_KEY" "$RUNPOD_API_BASE/pods/$pod_id")"
+                    status="$(jq -r '.desiredStatus // empty' <<<"$pod")"
+                    if [[ "$status" != "RUNNING" ]]; then
+                      try_start_pod "$pod_id"
+                      start_rc=$?
+                      if [[ $start_rc -ne 0 ]]; then
+                        if [[ $start_rc -eq 10 ]]; then
+                          echo "capacity error on pod $pod_id; trying next pod."
+                          return 1
+                        fi
+                        echo "start failed for pod $pod_id; trying next pod."
+                        return 1
+                      fi
+                    fi
+
+                    if wait_for_endpoint "$pod_id" 240; then
+                      return 0
+                    fi
+                    rc=$?
+                    if [[ $rc -eq 10 ]]; then
+                      echo "capacity error on pod $pod_id during wait; trying next pod."
+                      return 1
+                    fi
+                    echo "pod $pod_id did not become reachable; trying next pod."
+                    return 1
+                  }
+
+                  # Keep trying for a while: pod capacity is bursty; waiting here is cheap (runner only).
+                  acquire_deadline="$(( $(date +%s) + 1800 ))"
+                  cycle=0
+
+                  cloud_types=("${RUNPOD_CLOUD_TYPE:-SECURE}")
+                  if [[ -n "${RUNPOD_CLOUD_TYPE_FALLBACKS:-}" ]]; then
+                    # shellcheck disable=SC2206
+                    cloud_types+=(${RUNPOD_CLOUD_TYPE_FALLBACKS})
+                  fi
+
+                  gpu_types=("${RUNPOD_GPU_TYPE_ID:?missing RUNPOD_GPU_TYPE_ID}")
+                  if [[ -n "${RUNPOD_GPU_TYPE_ID_FALLBACKS:-}" ]]; then
+                    # shellcheck disable=SC2206
+                    gpu_types+=(${RUNPOD_GPU_TYPE_ID_FALLBACKS})
+                  fi
+
+                  while (( $(date +%s) < acquire_deadline )); do
+                    cycle=$((cycle + 1))
+                    pods_raw="$(list_pods)"
+                    pods_json="$(jq -c '.' <<<"$pods_raw" | pods_sorted)"
+                    count="$(jq 'length' <<<"$pods_json")"
+
+                    echo "pod pool: prefix=$POD_NAME_PREFIX count=$count max=$MAX_PODS"
+                    jq -r '.[] | "\(.createdAt) \(.name) \(.id)"' <<<"$pods_json" || true
+
+                    for pod_id in $(jq -r '.[].id' <<<"$pods_json"); do
+                      if acquire_one_pod "$pod_id"; then
+                        echo "Acquired pod: $pod_id"
+                        exit 0
+                      fi
+                    done
+
+                    # None of the existing pods could be started/reached. Rotate.
+                    if [[ "$count" -ge "$MAX_PODS" && "$count" -gt 0 ]]; then
+                      oldest_id="$(jq -r '.[0].id' <<<"$pods_json")"
+                      delete_pod "$oldest_id" || true
+                    fi
+
+                    new_name="$POD_NAME_PREFIX-$(date +%s)"
+                    created_any=false
+                    for cloud_type in "${cloud_types[@]}"; do
+                      for gpu_type_id in "${gpu_types[@]}"; do
+                        echo "Creating new pod: $new_name (cloudType=$cloud_type gpuTypeId=$gpu_type_id)"
+                        set +e
+                        new_id="$(create_pod "$new_name" "$cloud_type" "$gpu_type_id")"
+                        create_rc=$?
+                        set -e
+                        if [[ $create_rc -eq 10 ]]; then
+                          echo "Create pod capacity issue (cloudType=$cloud_type gpuTypeId=$gpu_type_id); trying next option..." >&2
+                          continue
+                        fi
+                        if [[ $create_rc -ne 0 ]]; then
+                          echo "Create pod failed (cloudType=$cloud_type gpuTypeId=$gpu_type_id rc=$create_rc); trying next option..." >&2
+                          continue
+                        fi
+                        created_any=true
+                        echo "Created: $new_id"
+                        if acquire_one_pod "$new_id"; then
+                          echo "Acquired new pod: $new_id"
+                          exit 0
+                        fi
+                      done
+                    done
+
+                    if [[ "$created_any" == "false" ]]; then
+                      echo "No capacity to create a pod in any allowed cloud/gpu combo; backing off..." >&2
+                      sleep 60
+                      continue
+                    fi
+                  done
+
+                  echo "Failed to acquire any usable pod before deadline." >&2
+                  exit 1
+
+            - name: Wait for SSH handshake
+              run: |
+                  set -euo pipefail
+                  : "${POD_IP:?missing POD_IP}"
+                  : "${POD_SSH_PORT:?missing POD_SSH_PORT}"
+
+                  for i in $(seq 1 60); do
+                    if ssh -i ~/.ssh/runpod_key \
+                      -o BatchMode=yes \
+                      -o StrictHostKeyChecking=no \
+                      -o UserKnownHostsFile=/dev/null \
+                      -o ConnectTimeout=10 \
+                      -o ServerAliveInterval=30 \
+                      -o ServerAliveCountMax=6 \
+                      -p "$POD_SSH_PORT" \
+                      root@"$POD_IP" \
+                      'echo ssh-ready' >/dev/null 2>&1; then
+                      exit 0
+                    fi
+                    echo "waiting for ssh..."
+                    sleep 10
+                  done
+
+                  echo "SSH never became ready." >&2
+                  exit 1
+
+            - name: Run workload on pod (fails job on non-zero)
+              env:
+                  RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+              run: |
+                  set -euo pipefail
+                  : "${POD_IP:?missing POD_IP}"
+                  : "${POD_SSH_PORT:?missing POD_SSH_PORT}"
+
+                  : "${POD_ID:?missing POD_ID}"
+                  : "${RUNPOD_API_KEY:?missing RUNPOD_API_KEY}"
+
+                  refresh_pod_endpoint() {
+                    pod="$(curl -sSf -H "Authorization: Bearer $RUNPOD_API_KEY" \
+                      "$RUNPOD_API_BASE/pods/$POD_ID")"
+
+                    ip="$(jq -r '.publicIp // empty' <<<"$pod")"
+                    port="$(jq -r '.portMappings["22"] // empty' <<<"$pod")"
+                    if [[ -n "$ip" && -n "$port" ]]; then
+                      POD_IP="$ip"
+                      POD_SSH_PORT="$port"
+                      export POD_IP POD_SSH_PORT
+                    fi
+                  }
+
+                  ssh_pod() {
+                    ssh -i ~/.ssh/runpod_key \
+                      -o BatchMode=yes \
+                      -o StrictHostKeyChecking=no \
+                      -o UserKnownHostsFile=/dev/null \
+                      -o ConnectTimeout=15 \
+                      -o LogLevel=ERROR \
+                      -o ServerAliveInterval=30 \
+                      -o ServerAliveCountMax=6 \
+                      -p "$POD_SSH_PORT" \
+                      root@"$POD_IP" "$@"
+                  }
+
+                  scp_to_pod() {
+                    scp -i ~/.ssh/runpod_key \
+                      -o BatchMode=yes \
+                      -o StrictHostKeyChecking=no \
+                      -o UserKnownHostsFile=/dev/null \
+                      -o ConnectTimeout=15 \
+                      -o LogLevel=ERROR \
+                      -P "$POD_SSH_PORT" \
+                      "$@"
+                  }
+
+                  # Build a remote job script so the workload survives transient SSH disconnects.
+                  cat > pod_job.sh <<'POD_EOF'
+                  #!/usr/bin/env bash
+                  set -euo pipefail
+
+                  RC_FILE=/workspace/modded-nanogpt.rc
+                  LOG_ZIP=/workspace/modded-nanogpt-logs.zip
+
+                  _finalize() {
+                    rc=$?
+                    set +e
+                    cd /workspace || true
+                    rm -f "$LOG_ZIP"
+                    # Only package training outputs under modded-nanogpt/logs/.
+                    if [ -d /workspace/modded-nanogpt/logs ]; then
+                      zip -r "$LOG_ZIP" "modded-nanogpt/logs" >/dev/null 2>&1 || true
+                    fi
+                    # Mark completion only after packaging finishes so the workflow doesn't download a partial zip.
+                    printf '%s' "$rc" > "$RC_FILE" 2>/dev/null || true
+                    exit "$rc"
+                  }
+                    trap _finalize EXIT
+
+                    cd /workspace
+                    export DEBIAN_FRONTEND=noninteractive
+                    export PIP_DISABLE_PIP_VERSION_CHECK=1
+                    export GIT_LFS_SKIP_SMUDGE=1
+                    export PIP_CACHE_DIR=/workspace/.cache/pip
+                    export HF_HOME=/workspace/.cache/huggingface
+                    export HF_HUB_CACHE=/workspace/.cache/huggingface/hub
+                    export XDG_CACHE_HOME=/workspace/.cache
+                    # RunPod's `/workspace` volume can behave like network storage; Triton/Inductor hit
+                    # "stale file handle" errors under heavy parallel compilation there. Keep these on
+                    # container-local disk for robustness.
+                    export TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor
+                    export TRITON_CACHE_DIR=/root/.cache/triton
+  
+                    mkdir -p /workspace/.cache/pip /workspace/.cache/huggingface /root/.cache/torchinductor /root/.cache/triton
+
+                  echo "[job] ensuring git/zip..."
+                  need_apt=0
+                  command -v git >/dev/null 2>&1 || need_apt=1
+                  command -v zip >/dev/null 2>&1 || need_apt=1
+                  if [[ "$need_apt" == "1" ]]; then
+                    echo "[job] installing apt deps..."
+                    for attempt in $(seq 1 5); do
+                      if apt-get update && apt-get install -y git zip; then
+                        break
+                      fi
+                      echo "[job] apt-get failed (attempt=$attempt), retrying..." >&2
+                      sleep $((attempt * 5))
+                    done
+                    command -v git >/dev/null 2>&1 || { echo "[job] git missing after install attempts" >&2; exit 1; }
+                    command -v zip >/dev/null 2>&1 || { echo "[job] zip missing after install attempts" >&2; exit 1; }
+                  fi
+
+                  echo "[job] python:"
+                  # Align with record environment (Python 3.10).
+                  # Triton builds extensions and needs Python headers (Python.h) + a compiler toolchain.
+                  if ! command -v python3.10 >/dev/null 2>&1; then
+                    echo "[job] installing python3.10..."
+                    for attempt in $(seq 1 5); do
+                      if apt-get update && apt-get install -y python3.10 python3.10-venv python3.10-dev build-essential; then
+                        break
+                      fi
+                      echo "[job] python3.10 install failed (attempt=$attempt), retrying..." >&2
+                      sleep $((attempt * 5))
+                    done
+                  else
+                    # python3.10 may exist without venv/ensurepip or headers.
+                    apt-get update && apt-get install -y python3.10-venv python3.10-dev build-essential || true
+                  fi
+                  python3.10 --version
+
+                  echo "[job] syncing repo..."
+                  : "${GITHUB_SERVER_URL:?missing GITHUB_SERVER_URL}"
+                  : "${GITHUB_REPOSITORY:?missing GITHUB_REPOSITORY}"
+                  : "${GITHUB_REF_NAME:?missing GITHUB_REF_NAME}"
+                  : "${GITHUB_SHA:?missing GITHUB_SHA}"
+
+                  REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+                  if [ -d /workspace/modded-nanogpt/.git ]; then
+                    cd /workspace/modded-nanogpt
+                    git remote set-url origin "$REPO_URL" || true
+                    git fetch --depth 1 origin "$GITHUB_SHA"
+                    git checkout -f "$GITHUB_SHA"
+                  else
+                    rm -rf /workspace/modded-nanogpt
+                    git clone --depth 1 --branch "${GITHUB_REF_NAME}" "$REPO_URL" /workspace/modded-nanogpt
+                    cd /workspace/modded-nanogpt
+                    if [[ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+                      git fetch --depth 1 origin "$GITHUB_SHA"
+                      git checkout -f "$GITHUB_SHA"
+                    fi
+                  fi
+                  # Ensure logs directory exists so we always produce a zip artifact, even if training fails early.
+                  mkdir -p /workspace/modded-nanogpt/logs
+                  # Clear previous run logs on the reused pod; the summary step should report *this* run,
+                  # not the best across history.
+                  rm -rf /workspace/modded-nanogpt/logs/*
+                  {
+                    echo "==== infra $(date -u) ===="
+                    uname -a || true
+                    echo ""
+                    echo "== nvidia-smi =="
+                    nvidia-smi || true
+                    echo ""
+                    echo "== nvidia-smi topo -m =="
+                    nvidia-smi topo -m || true
+                    echo ""
+                    echo "== lscpu =="
+                    lscpu || true
+                  } > /workspace/modded-nanogpt/logs/infra.txt 2>&1 || true
+
+                  echo "[job] installing python deps..."
+                  VENV_DIR=/workspace/.venv-modded-nanogpt-py310
+                  if [ ! -f "$VENV_DIR/bin/activate" ] || [ ! -x "$VENV_DIR/bin/python" ]; then
+                    rm -rf "$VENV_DIR" || true
+                    python3.10 -m venv --system-site-packages "$VENV_DIR"
+                  fi
+                  # shellcheck disable=SC1091
+                  source "$VENV_DIR/bin/activate"
+                  if ! python -m pip --version >/dev/null 2>&1; then
+                    rm -rf "$VENV_DIR" || true
+                    python3.10 -m venv --system-site-packages "$VENV_DIR"
+                    # shellcheck disable=SC1091
+                    source "$VENV_DIR/bin/activate"
+                  fi
+
+                  export PIP_DISABLE_PIP_VERSION_CHECK=1
+                  export PIP_DEFAULT_TIMEOUT=60
+
+                  ensure_dns() {
+                    if getent hosts files.pythonhosted.org >/dev/null 2>&1; then
+                      return 0
+                    fi
+                    echo "[job] DNS resolution failed; attempting to set resolvers..." >&2
+                    if [ -w /etc/resolv.conf ]; then
+                      printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf || true
+                    fi
+                    getent hosts files.pythonhosted.org >/dev/null 2>&1
+                  }
+
+                  pip_retry() {
+                    for attempt in $(seq 1 8); do
+                      if "$@"; then
+                        return 0
+                      fi
+                      echo "[job] pip failed (attempt=$attempt); retrying..." >&2
+                      ensure_dns || true
+                      sleep $((attempt * 10))
+                    done
+                    return 1
+                  }
+
+                  ensure_dns || true
+
+                  # Match README torch install exactly (and avoid pip pulling a different torch/triton).
+                  TORCH_SPEC="torch==2.10.0.dev20251210+cu126"
+                  TORCH_INDEX_URL="https://download.pytorch.org/whl/nightly/cu126"
+                  DESIRED_TORCH_VERSION="2.10.0.dev20251210+cu126"
+                  INSTALLED_TORCH_VERSION="$(python3 - <<'PY'
+                  try:
+                      import torch
+                      print(torch.__version__)
+                  except Exception:
+                      print("")
+                  PY
+                  )"
+                  if [ "$INSTALLED_TORCH_VERSION" != "$DESIRED_TORCH_VERSION" ]; then
+                    echo "[job] installing torch: $TORCH_SPEC"
+                    pip_retry pip install --retries 10 --timeout 60 --index-url "$TORCH_INDEX_URL" "$TORCH_SPEC"
+                  else
+                    echo "[job] torch already matches README: $INSTALLED_TORCH_VERSION"
+                  fi
+
+                    # Only reinstall deps if requirements.txt changed.
+                    REQ_HASH_FILE=/workspace/.cache/requirements.sha256
+                    REQ_HASH="$( (sha256sum requirements.txt; echo "$TORCH_SPEC"; echo "$TORCH_INDEX_URL") | sha256sum | awk '{print $1}')"
+                    OLD_REQ_HASH="$(cat "$REQ_HASH_FILE" 2>/dev/null || true)"
+                    if [ "$REQ_HASH" != "$OLD_REQ_HASH" ]; then
+                      # Don't let requirements.txt override the pinned torch above.
+                      grep -v -E '^[[:space:]]*torch([[:space:]]|$)' requirements.txt > /tmp/requirements.no-torch.txt
+                      pip_retry pip install --retries 10 --timeout 60 -r /tmp/requirements.no-torch.txt
+                      printf '%s' "$REQ_HASH" > "$REQ_HASH_FILE"
+                    else
+                      echo "[job] requirements unchanged; skipping pip install"
+                    fi
+
+                  echo "[job] torch:"
+                  python3.10 - <<'PY'
+                  import torch
+                  print(torch.__version__)
+                  print("cuda:", torch.version.cuda)
+                  print("is_available:", torch.cuda.is_available())
+                  PY
+
+                  echo "[job] preparing data..."
+                  # Keep dataset persisted on /workspace, but train from container-local disk.
+                  DATA_PERSIST=/workspace/.cache/fineweb10B
+                  DATA_LOCAL=/root/.cache/fineweb10B
+                  mkdir -p "$DATA_PERSIST" "$DATA_LOCAL"
+                  mkdir -p data
+                  ln -sfn "$DATA_PERSIST" data/fineweb10B
+                  python3.10 data/cached_fineweb10B.py 9
+                  # Copy to local disk for faster training IO.
+                  rm -rf "$DATA_LOCAL"/*
+                  cp -a "$DATA_PERSIST"/. "$DATA_LOCAL"/
+                  ln -sfn "$DATA_LOCAL" data/fineweb10B
+
+                  echo "[job] starting training..."
+                  ./run.sh
+                  POD_EOF
+
+                  chmod +x pod_job.sh
+
+                  # Upload the script.
+                  scp_to_pod ./pod_job.sh root@"$POD_IP":/workspace/pod_job.sh
+
+                  # Clear any stale state from a previous run on the reused pod.
+                  ssh_pod "rm -f /workspace/modded-nanogpt.rc /workspace/modded-nanogpt.pid /workspace/modded-nanogpt-job.log /workspace/modded-nanogpt-logs.zip || true"
+
+                  # Start it in the background (log to file) and return immediately.
+                  ssh_pod "GITHUB_SERVER_URL='${GITHUB_SERVER_URL}' GITHUB_REPOSITORY='${GITHUB_REPOSITORY}' GITHUB_REF_NAME='${GITHUB_REF_NAME}' GITHUB_SHA='${GITHUB_SHA}' nohup /workspace/pod_job.sh > /workspace/modded-nanogpt-job.log 2>&1 & echo \$! > /workspace/modded-nanogpt.pid"
+
+                  # Poll for completion (RC file). Retry SSH with refreshed port mapping if needed.
+                  # GitHub-hosted runners have a hard 6h job limit; keep a buffer for startup + teardown.
+                  for i in $(seq 1 300); do
+                    set +e
+                    ssh_pod 'test -f /workspace/modded-nanogpt.rc' >/dev/null 2>&1
+                    rc=$?
+                    set -e
+
+                    if [[ $rc -eq 0 ]]; then
+                      break
+                    fi
+
+                    if (( i % 5 == 0 )); then
+                      echo "still running... (minute=$i)"
+                      set +e
+                      ssh_pod 'tail -n 30 /workspace/modded-nanogpt-job.log' || true
+                      set -e
+                    fi
+
+                    sleep 60
+
+                    if (( i % 2 == 0 )); then
+                      refresh_pod_endpoint || true
+                    fi
+                  done
+
+                  if ! ssh_pod 'test -f /workspace/modded-nanogpt.rc' >/dev/null 2>&1; then
+                    echo "Timed out waiting for remote job to finish." >&2
+                    set +e
+                    ssh_pod 'tail -n 200 /workspace/modded-nanogpt-job.log' || true
+                    set -e
+                    exit 1
+                  fi
+
+                  job_rc="$(ssh_pod 'cat /workspace/modded-nanogpt.rc' | tr -d '\r\n')"
+                  echo "Remote job rc=$job_rc"
+                  echo "JOB_RC=$job_rc" >> "$GITHUB_ENV"
+
+                  if [[ "$job_rc" != "0" ]]; then
+                    set +e
+                    ssh_pod 'tail -n 200 /workspace/modded-nanogpt-job.log' || true
+                    set -e
+                    exit 1
+                  fi
+
+            - name: Download logs zip (best effort)
+              if: always()
+              env:
+                  RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+              run: |
+                  set -euo pipefail
+                  : "${RUNPOD_API_KEY:?missing RUNPOD_API_KEY}"
+
+                  if [[ -z "${POD_ID:-}" ]]; then
+                    echo "No POD_ID, skipping download."
+                    exit 0
+                  fi
+
+                  refresh_pod_endpoint() {
+                    pod="$(curl -sSf -H "Authorization: Bearer $RUNPOD_API_KEY" \
+                      "$RUNPOD_API_BASE/pods/$POD_ID")"
+
+                    ip="$(jq -r '.publicIp // empty' <<<"$pod")"
+                    port="$(jq -r '.portMappings["22"] // empty' <<<"$pod")"
+                    status="$(jq -r '.desiredStatus // empty' <<<"$pod")"
+                    if [[ -n "$ip" && -n "$port" ]]; then
+                      POD_IP="$ip"
+                      POD_SSH_PORT="$port"
+                      echo "POD_IP=$POD_IP" >> "$GITHUB_ENV"
+                      echo "POD_SSH_PORT=$POD_SSH_PORT" >> "$GITHUB_ENV"
+                    fi
+                    if [[ -n "${status:-}" ]]; then
+                      echo "pod status=$status ip=${ip:-} port=${port:-}"
+                    fi
+                  }
+
+                  refresh_pod_endpoint || true
+                  if [[ -z "${POD_IP:-}" || -z "${POD_SSH_PORT:-}" ]]; then
+                    echo "No POD_IP/POD_SSH_PORT, skipping download."
+                    exit 0
+                  fi
+
+                  rm -f ./modded-nanogpt-logs.zip || true
+
+                  download_logs_zip() {
+                    for attempt in $(seq 1 12); do
+                      refresh_pod_endpoint || true
+                      if [[ -z "${POD_IP:-}" || -z "${POD_SSH_PORT:-}" ]]; then
+                        sleep 10
+                        continue
+                      fi
+
+                      set +e
+                      ssh -i ~/.ssh/runpod_key \
+                        -o BatchMode=yes \
+                        -o StrictHostKeyChecking=no \
+                        -o UserKnownHostsFile=/dev/null \
+                        -o ConnectTimeout=15 \
+                        -o LogLevel=ERROR \
+                        -p "$POD_SSH_PORT" \
+                        root@"$POD_IP" 'test -f /workspace/modded-nanogpt-logs.zip'
+                      exists=$?
+                      set -e
+
+                      if [[ $exists -ne 0 ]]; then
+                        sleep 10
+                        continue
+                      fi
+
+                      set +e
+                      scp -i ~/.ssh/runpod_key \
+                        -o BatchMode=yes \
+                        -o StrictHostKeyChecking=no \
+                        -o UserKnownHostsFile=/dev/null \
+                        -o ConnectTimeout=30 \
+                        -o LogLevel=ERROR \
+                        -P "$POD_SSH_PORT" \
+                        root@"$POD_IP":/workspace/modded-nanogpt-logs.zip \
+                        ./modded-nanogpt-logs.zip
+                      ok=$?
+                      set -e
+
+                      if [[ $ok -eq 0 ]]; then
+                        echo "downloaded: modded-nanogpt-logs.zip"
+                        ls -lh ./modded-nanogpt-logs.zip || true
+                        return 0
+                      fi
+
+                      sleep 10
+                    done
+
+                    echo "Failed to download /workspace/modded-nanogpt-logs.zip (best effort)." >&2
+                    return 1
+                  }
+
+                  download_logs_zip || true
+
+            - name: Summarize training metrics
+              if: always()
+              id: metrics
+              run: |
+                  set -euo pipefail
+                  python3 - <<'PY'
+                  import os
+                  import re
+                  import zipfile
+                  from typing import Optional, Dict, Any
+
+                  zip_path = "modded-nanogpt-logs.zip"
+                  summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+                  output_path = os.environ.get("GITHUB_OUTPUT")
+
+                  pattern = re.compile(
+                      r"step:(?P<step>\d+)/(?P<total>\d+)\s+"
+                      r"val_loss:(?P<val_loss>\d+(?:\.\d+)?)\s+"
+                      r"train_time:(?P<train_time_ms>\d+)ms\s+"
+                      r"step_avg:(?P<step_avg_ms>\d+(?:\.\d+)?)ms"
+                  )
+
+                  best: Optional[Dict[str, Any]] = None
+
+                  def consider(match: re.Match, *, file: str, line: str) -> None:
+                      global best
+                      step = int(match.group("step"))
+                      total = int(match.group("total"))
+                      candidate = {
+                          "step": step,
+                          "total": total,
+                          "val_loss": float(match.group("val_loss")),
+                          "train_time_ms": int(match.group("train_time_ms")),
+                          "step_avg_ms": float(match.group("step_avg_ms")),
+                          "file": file,
+                          "line": line.strip(),
+                      }
+                      if best is None:
+                          best = candidate
+                          return
+                      if (candidate["step"], candidate["total"]) > (best["step"], best["total"]):
+                          best = candidate
+
+                  zip_missing = not os.path.exists(zip_path)
+                  if not zip_missing:
+                      try:
+                          with zipfile.ZipFile(zip_path) as zf:
+                              txt_files = [
+                                  name
+                                  for name in zf.namelist()
+                                  if name.endswith(".txt") and "/logs/" in name and not name.endswith("/")
+                              ]
+                              for name in txt_files:
+                                  try:
+                                      content = zf.read(name).decode("utf-8", errors="replace")
+                                  except Exception:
+                                      continue
+                                  for line in content.splitlines():
+                                      m = pattern.search(line)
+                                      if m:
+                                          consider(m, file=name, line=line)
+                      except zipfile.BadZipFile:
+                          zip_missing = True
+
+                  md_lines = []
+                  md_lines.append("## Modded NanoGPT metrics")
+                  if zip_missing:
+                      md_lines.append("")
+                      md_lines.append("- No `modded-nanogpt-logs.zip` found (or invalid zip).")
+                  elif best is None:
+                      md_lines.append("")
+                      md_lines.append("- No final metrics line found in `logs/*.txt` inside the zip.")
+                  else:
+                      md_lines.append("")
+                      md_lines.append(f"- Source: `{best['file']}`")
+                      md_lines.append(f"- Final: `{best['line']}`")
+                      md_lines.append(f"- `val_loss`: **{best['val_loss']:.4f}**")
+                      md_lines.append(f"- `train_time`: {best['train_time_ms']}ms")
+                      md_lines.append(f"- `step_avg`: {best['step_avg_ms']:.2f}ms")
+
+                  if summary_path:
+                      with open(summary_path, "a", encoding="utf-8") as f:
+                          f.write("\n".join(md_lines) + "\n")
+
+                  if output_path and best is not None:
+                      with open(output_path, "a", encoding="utf-8") as f:
+                          f.write(f"val_loss={best['val_loss']:.6f}\n")
+                          f.write(f"train_time_ms={best['train_time_ms']}\n")
+                          f.write(f"step_avg_ms={best['step_avg_ms']:.6f}\n")
+                          f.write(f"metrics_file={best['file']}\n")
+                          f.write(f"metrics_line={best['line']}\n")
+
+                  if best is not None:
+                      print(f"val_loss={best['val_loss']:.6f} train_time_ms={best['train_time_ms']} step_avg_ms={best['step_avg_ms']:.6f}")
+                  PY
+
+            - name: Fail if val_loss > 3.283
+              if: ${{ env.JOB_RC == '0' && steps.metrics.outputs.val_loss != '' }}
+              env:
+                  VAL_LOSS: ${{ steps.metrics.outputs.val_loss }}
+              run: |
+                  set -euo pipefail
+                  python3 - <<'PY'
+                  import os
+                  import re
+                  import sys
+
+                  threshold = 3.283
+                  raw = os.environ["VAL_LOSS"]
+                  # Be tolerant if the runner passes a multi-line string or a literal "\n"-joined blob.
+                  first = raw.strip().splitlines()[0].strip()
+                  first = first.split("\\n", 1)[0].strip()
+                  m = re.search(r"[-+]?\d+(?:\.\d+)?", first)
+                  if not m:
+                      raise ValueError(f"could not parse val_loss from: {raw!r}")
+                  val = float(m.group(0))
+                  if val > threshold:
+                      print(f"val_loss {val:.4f} > {threshold} (failing run)")
+                      sys.exit(1)
+                  print(f"val_loss {val:.4f} <= {threshold}")
+                  PY
+
+            - name: Upload logs artifact
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: modded-nanogpt-logs-${{ github.ref_name }}-${{ github.run_id }}
+                  path: |
+                      modded-nanogpt-logs.zip
+                  if-no-files-found: warn
+
+            - name: Terminate pod (always)
+              if: always()
+              continue-on-error: true
+              env:
+                  RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+              run: |
+                  set -euo pipefail
+                  if [[ -z "${POD_ID:-}" ]]; then
+                    echo "No POD_ID, nothing to terminate."
+                    exit 0
+                  fi
+
+                  # Stop instead of deleting so `/workspace` persists for the next run (volume + caches).
+                  # This keeps costs low between runs (storage only).
+                  for i in $(seq 1 10); do
+                    if curl -sSf -X POST "$RUNPOD_API_BASE/pods/$POD_ID/stop" \
+                      -H "Authorization: Bearer $RUNPOD_API_KEY" >/dev/null; then
+                      echo "Pod $POD_ID stopped."
+                      exit 0
+                    fi
+                    echo "Stop failed, retrying..."
+                    sleep 5
+                  done
+
+                  echo "Failed to stop pod $POD_ID after retries."
+                  exit 0
