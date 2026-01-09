@@ -19,9 +19,9 @@ import gc
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 
-random.seed(1337)
-torch.manual_seed(1337)
-torch.cuda.manual_seed_all(1337)
+random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
 
 torch.empty(
     1, device=f"cuda:{os.environ['LOCAL_RANK']}", requires_grad=True
