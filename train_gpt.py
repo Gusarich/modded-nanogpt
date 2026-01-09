@@ -1343,8 +1343,12 @@ class GPT(nn.Module):
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
-        smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
-        x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
+        # Avoid materializing a full-size intermediate + cat by cloning once and updating in place.
+        x_gate = x[1:, :self.smear_gate.weight.size(-1)].clone()
+        smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x_gate))
+        x_new = x.clone()
+        x_new[1:].addcmul_(smear_gate_out, x[:-1])
+        x = x_new
         x = x0 = norm(x[None])
 
         # unbind gate banks to avoid select_backwards kernel
@@ -1810,7 +1814,7 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
     num_scheduled_iterations: int = 1735  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_extension_iterations: int = 25  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
     split_embed_frac: float = 2/3  # fraction of training when embeddings split from lm_head
