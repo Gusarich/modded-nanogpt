@@ -118,24 +118,29 @@ mm_op.register_autograd(backward, setup_context=setup_context)
 # Triton kernel for symmetric matrix multiplication by @byronxu99
 
 def _get_autotune_configs():
-    return [
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": bm,
-                "BLOCK_SIZE_N": bn,
-                "BLOCK_SIZE_K": bk,
-                "GROUP_SIZE_M": 8,
-                "LOWER_UPPER": 1,
-            },
-            num_stages=stages,
-            num_warps=warps,
-        )
-        for bm in [64, 128]
-        for bn in [64, 128, 256]
-        for bk in [64, 128]
-        for stages, warps in [(3, 4), (3, 8), (4, 4)]
-        if bm // bn <= 2 and bn // bm <= 2
-    ]
+    # Square tiles only: avoids redundant compute and overlapping stores when mirroring.
+    cfgs = []
+    for bm in [64, 128, 256]:
+        bn = bm
+        for bk in [64, 128]:
+            for stages, warps in [(3, 4), (3, 8), (4, 4), (4, 8)]:
+                if bm == 64 and warps == 8:
+                    continue
+                if bm == 256 and warps == 4:
+                    continue
+                cfgs.append(
+                    triton.Config(
+                        {
+                            "BLOCK_SIZE_M": bm,
+                            "BLOCK_SIZE_N": bn,
+                            "BLOCK_SIZE_K": bk,
+                            "GROUP_SIZE_M": 8,
+                        },
+                        num_stages=stages,
+                        num_warps=warps,
+                    )
+                )
+    return cfgs
 
 @triton.jit
 def _pid_to_block(
@@ -176,17 +181,14 @@ def XXT_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    LOWER_UPPER: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     batch_idx, m_idx, n_idx = _pid_to_block(
         pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
     )
 
-    # Skip blocks that don't need to be computed
-    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
-    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
-    if skip_block_below_diag or skip_block_above_diag:
+    # Compute only lower triangle at block granularity, mirror to fill upper.
+    if n_idx > m_idx:
         return
 
     # Index into one matrix of batch
@@ -220,10 +222,11 @@ def XXT_kernel(
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
     tl.store(c_ptrs, output, mask=c_mask)
 
-    # Store block of C mirrored across the diagonal
-    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
-    c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
-    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
+    # Do not mirror the diagonal block (redundant stores).
+    if m_idx != n_idx:
+        c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
+        c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
+        tl.store(c_ptrs_t, output.T, mask=c_mask_t)
 
 def XXT(A: torch.Tensor, out: torch.Tensor):
     """
@@ -270,7 +273,6 @@ def ba_plus_cAA_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    LOWER_UPPER: tl.constexpr,
 ):
     # This is mostly duplicated from XXT_kernel, but also loads and adds a block of A
     # Performance is slightly slower than XXT_kernel, so we use two separate kernels
@@ -279,10 +281,8 @@ def ba_plus_cAA_kernel(
         pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
     )
 
-    # Skip blocks that don't need to be computed
-    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
-    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
-    if skip_block_below_diag or skip_block_above_diag:
+    # Compute only lower triangle at block granularity, mirror to fill upper.
+    if n_idx > m_idx:
         return
 
     # Index into one matrix of batch
@@ -327,10 +327,10 @@ def ba_plus_cAA_kernel(
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
     tl.store(c_ptrs, output, mask=c_mask)
 
-    # Store block of C mirrored across the diagonal
-    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
-    c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
-    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
+    if m_idx != n_idx:
+        c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
+        c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
+        tl.store(c_ptrs_t, output.T, mask=c_mask_t)
 
 def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     """
