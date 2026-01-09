@@ -7,7 +7,7 @@ on:
     workflow_dispatch:
         inputs:
             action:
-                description: "run (default) or cleanup (delete RunPod pods created by this workflow)"
+                description: "run (default), cleanup (delete pods), or balance (print RunPod credit balance)"
                 required: false
                 default: "run"
             cloud_mode:
@@ -20,6 +20,54 @@ concurrency:
     cancel-in-progress: false
 
 jobs:
+    balance:
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'balance' }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        env:
+            RUNPOD_API_BASE: https://rest.runpod.io/v1
+        steps:
+            - name: Install deps
+              run: |
+                  set -euo pipefail
+                  sudo apt-get update
+                  sudo apt-get install -y jq
+
+            - name: Query RunPod balance
+              env:
+                  RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+              run: |
+                  set -euo pipefail
+                  : "${RUNPOD_API_KEY:?missing RUNPOD_API_KEY}"
+
+                  # Try a couple of likely endpoints; print only balance-like fields.
+                  try_paths=( "user" "users/me" "account" "profile" )
+                  for path in "${try_paths[@]}"; do
+                    echo "== GET $RUNPOD_API_BASE/$path =="
+                    resp="$(curl -sS -H "Authorization: Bearer $RUNPOD_API_KEY" "$RUNPOD_API_BASE/$path" || true)"
+                    if jq -e . >/dev/null 2>&1 <<<"$resp"; then
+                      # Prefer a single numeric balance field if present; otherwise show top-level keys.
+                      bal="$(jq -r '.. | .creditBalance? // .credits? // .balance? // empty' <<<"$resp" | head -n 1)"
+                      if [[ -n "$bal" && "$bal" != "null" ]]; then
+                        echo "balance=$bal"
+                        {
+                          echo "## RunPod balance"
+                          echo ""
+                          echo "- Endpoint: \`$path\`"
+                          echo "- Balance: \`$bal\`"
+                        } >> "$GITHUB_STEP_SUMMARY"
+                        exit 0
+                      fi
+                      echo "$resp" | jq -r 'keys | join(", ")' || true
+                    else
+                      echo "$resp" | head -n 5
+                    fi
+                    echo ""
+                  done
+
+                  echo "Couldn't find a recognizable balance field via tried endpoints." >&2
+                  exit 1
+
     cleanup:
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'cleanup' }}
         runs-on: ubuntu-latest
