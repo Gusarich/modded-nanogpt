@@ -1607,7 +1607,7 @@ def get_ws(step: int):
 # learning rate schedule: tied to batch size schedule, with cooldown at the end.
 def get_lr(step: int):
     if step > args.num_scheduled_iterations:
-        return 0.1
+        return 0.12
     lr_max = 1.0
     x = step / args.num_scheduled_iterations
     if x > 1/3:
@@ -1810,7 +1810,7 @@ class Hyperparameters:
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
     num_scheduled_iterations: int = 1735  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_extension_iterations: int = 25  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
     split_embed_frac: float = 2/3  # fraction of training when embeddings split from lm_head
