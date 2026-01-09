@@ -1343,8 +1343,12 @@ class GPT(nn.Module):
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
-        smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
-        x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
+        # Avoid materializing a full-size intermediate + cat by cloning once and updating in place.
+        x_gate = x[1:, :self.smear_gate.weight.size(-1)].clone()
+        smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x_gate))
+        x_new = x.clone()
+        x_new[1:].addcmul_(smear_gate_out, x[:-1])
+        x = x_new
         x = x0 = norm(x[None])
 
         # unbind gate banks to avoid select_backwards kernel
