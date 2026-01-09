@@ -1822,7 +1822,7 @@ class Hyperparameters:
     block_size: int = 128
     ws_schedule: tuple = (3, 7, 11)
     ws_final: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
-    ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
+    ws_validate_post_yarn_ext: int = 24 # extend long windows out even further after applying YaRN
 
 args = Hyperparameters()
 
