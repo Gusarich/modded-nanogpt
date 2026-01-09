@@ -1348,8 +1348,8 @@ class GPT(nn.Module):
         x = x0 = norm(x[None])
 
         # unbind gate banks to avoid select_backwards kernel
-        ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)] 
-        veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
+        ag = list(self.attn_gate_bank.unbind(0))
+        veg = list(self.ve_gate_bank.unbind(0))
         attn_gates = ag[:6] + [None] + ag[6:]
         ve_gates = [veg[0], veg[1]] + [None] * (self.num_layers - 5) + [veg[2], veg[3], veg[4]]
         assert len(attn_gates) == self.num_layers
