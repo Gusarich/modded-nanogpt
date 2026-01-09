@@ -1344,7 +1344,7 @@ class GPT(nn.Module):
 
         # smear token embed forward 1 position @classiclarryd
         smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
-        x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
+        x = x + F.pad(smear_gate_out * x[:-1], (0, 0, 1, 0))
         x = x0 = norm(x[None])
 
         # unbind gate banks to avoid select_backwards kernel
